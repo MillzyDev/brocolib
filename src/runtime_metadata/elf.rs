@@ -18,7 +18,7 @@ use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
 use object::read::coff::CoffFile;
 use object::{Endianness, File, Object, ObjectSection, ObjectSegment, ObjectSymbol, ObjectSymbolTable, RelocationEncoding, RelocationTarget};
 use std::collections::HashMap;
-use std::io::{self, Cursor};
+use std::io::{self, Cursor, Seek, SeekFrom};
 use std::str;
 use capstone::{arch, Capstone, InsnId};
 use capstone::arch::{ArchOperand, BuildsCapstone, BuildsCapstoneSyntax, DetailsArchInsn};
@@ -342,10 +342,14 @@ fn read_arr<T>(reader: &CoffReader, vaddr: u64, len: usize) -> Result<Vec<T>>
 where
     T: BinRead,
 {
+    if len == 0 {
+        return Ok(Vec::new())
+    }
     let mut cur = reader.make_cur(vaddr)?;
     let mut vec = Vec::with_capacity(len);
     for _ in 0..len {
-        vec.push(cur.read_le()?);
+        let value = cur.read_le()?;
+        vec.push(value);
     }
     Ok(vec)
 }
@@ -355,6 +359,10 @@ where
     T: BinRead,
 {
     let count = cur.read_u32::<LittleEndian>()? as usize;
+    if count == 0 {
+        cur.seek(SeekFrom::Current(12))?;
+        return Ok(Vec::new());
+    }
     let _padding = cur.read_u32::<LittleEndian>()?;
     let addr = cur.read_u64::<LittleEndian>()?;
     read_arr(reader, addr, count)
@@ -365,6 +373,10 @@ where
     T: BinRead + Default + Clone,
 {
     let count = cur.read_u32::<LittleEndian>()? as usize;
+    if count == 0 {
+        cur.seek(SeekFrom::Current(12))?;
+        return Ok(Vec::new());
+    }
     let _padding = cur.read_u32::<LittleEndian>()?;
     let addr = cur.read_u64::<LittleEndian>()?;
     if addr_in_bss(reader.elf, addr) {
@@ -404,7 +416,7 @@ impl<'data> Il2CppCodeGenModule<'data> {
 
 impl<'data> Il2CppCodeRegistration<'data> {
     fn read(coff: &File<'data>, data: &'data [u8], addr: u64) -> Result<Self> {
-        let reader = CoffReader::new(coff, &data);
+        let reader = CoffReader::new(coff, data);
         let mut cur = reader.make_cur(addr)?;
 
         let reverse_pinvoke_wrappers = read_len_arr(&reader, &mut cur)?;
@@ -426,7 +438,7 @@ impl<'data> Il2CppCodeRegistration<'data> {
 
         // windowsRuntimeFactoryCount
         // windowsRuntimeFactoryTable
-        let _windows_runtime_factory_table: Vec<u64> = read_len_arr(&reader, &mut cur)?;
+        let _windows_runtime_factory_table: Vec<u64> = read_len_arr_nullable(&reader, &mut cur)?;
 
         let module_addrs = read_len_arr(&reader, &mut cur)?;
         let mut code_gen_modules = Vec::with_capacity(module_addrs.len());

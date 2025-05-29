@@ -68,6 +68,6 @@ mod tests {
 
         let metadata = Metadata::parse(&global_metadata_data, &coff_data).unwrap();
 
-        println!("{}", metadata.global_metadata.assemblies.as_vec().len())
+        println!("{}", metadata.runtime_metadata.code_registration.code_gen_modules.iter().len())
     }
 }
