@@ -46,12 +46,28 @@ pub enum MetadataParseError {
 }
 
 impl<'gmd, 'rmd> Metadata<'gmd, 'rmd> {
-    pub fn parse(global_metadata: &'gmd [u8], elf: &'rmd [u8]) -> Result<Self, MetadataParseError> {
+    pub fn parse(global_metadata: &'gmd [u8], coff: &'rmd [u8]) -> Result<Self, MetadataParseError> {
         let global_metadata = global_metadata::deserialize(global_metadata)?;
-        let runtime_metadata = RuntimeMetadata::read_elf(elf, &global_metadata)?;
+        let runtime_metadata = RuntimeMetadata::read_coff(coff, &global_metadata)?;
         Ok(Metadata {
             global_metadata,
             runtime_metadata,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use super::*;
+
+    #[test]
+    fn it_works() {
+        let global_metadata_data = fs::read("C:\\Users\\Millz\\Documents\\My Games\\Modding Test\\Mod Testing_Data\\il2cpp_data\\Metadata\\global-metadata.dat").unwrap();
+        let coff_data = fs::read("C:\\Users\\Millz\\Documents\\My Games\\Modding Test\\GameAssembly.dll").unwrap();
+
+        let metadata = Metadata::parse(&global_metadata_data, &coff_data).unwrap();
+
+        println!("{}", metadata.global_metadata.assemblies.as_vec().len())
     }
 }

@@ -6,21 +6,29 @@
 //! information.
 //!
 //! To read metadata information from `libil2cpp.so`, see
-//! [`RuntimeMetadata::read()`] and [`RuntimeMetadata::read_elf()`].
+//! [`RuntimeMetadata::read()`] and [`RuntimeMetadata::read_coff()`].
 
+use std::any::Any;
 use super::*;
 use crate::global_metadata::{GenericParameterIndex, GlobalMetadata, TypeDefinitionIndex};
-use bad64::{disasm, DecodeError, Imm, Instruction, Op, Operand, Reg};
+//use bad64::{disasm, DecodeError, Imm, Instruction, Op, Operand, Reg};
+
 use binread::{BinRead, BinReaderExt};
 use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use object::read::elf::ElfFile64;
-use object::{Endianness, Object, ObjectSection, ObjectSegment, ObjectSymbol, RelocationEncoding, RelocationTarget};
+use object::read::coff::CoffFile;
+use object::{Endianness, File, Object, ObjectSection, ObjectSegment, ObjectSymbol, ObjectSymbolTable, RelocationEncoding, RelocationTarget};
 use std::collections::HashMap;
 use std::io::{self, Cursor};
 use std::str;
+use capstone::{arch, Capstone, InsnId};
+use capstone::arch::{ArchOperand, BuildsCapstone, BuildsCapstoneSyntax, DetailsArchInsn};
+use capstone::arch::x86::{X86OpMem, X86Operand, X86OperandType};
+use iced_x86::{ConstantOffsets, Decoder, DecoderOptions, Instruction, Mnemonic, OpKind};
+use object::read::elf::ElfFile;
 use thiserror::Error;
 
-pub type Elf<'data> = ElfFile64<'data, Endianness>;
+pub type Coff<'data> = CoffFile<'data>;
+pub type Elf<'data> = ElfFile<'data, Endianness>;
 
 #[derive(Error, Debug, Clone, Copy)]
 #[error("error disassembling code")]
@@ -29,12 +37,12 @@ pub struct DisassembleError;
 #[derive(Error, Debug)]
 pub enum Il2CppBinaryError {
     #[error("error disassembling code")]
-    Disassemble(DecodeError),
+    Disassemble(DisassembleError),
 
     #[error("failed to convert virtual address {0:#016x}")]
     VAddrConv(u64),
 
-    #[error("could not find il2cpp_init symbol in elf")]
+    #[error("could not find il2cpp_init symbol in coff")]
     MissingIl2CppInit,
 
     #[error("could not find indirect branch in Runtime::Init")]
@@ -75,16 +83,16 @@ pub fn get_str(data: &[u8], offset: usize) -> Result<&str> {
     Ok(str)
 }
 
-pub fn addr_in_bss(elf: &Elf, vaddr: u64) -> bool {
-    match elf.section_by_name(".bss") {
+pub fn addr_in_bss(coff: &File, vaddr: u64) -> bool {
+    match coff.section_by_name(".bss") {
         Some(bss) => bss.address() <= vaddr && vaddr - bss.address() < bss.size(),
         None => false,
     }
 }
 
 /// Converts a virtual address in the elf to a file offset
-pub fn vaddr_conv(elf: &Elf, vaddr: u64) -> Result<u64> {
-    for segment in elf.segments() {
+pub fn vaddr_conv(coff: &File, vaddr: u64) -> Result<u64> {
+    for segment in coff.segments() {
         if segment.address() <= vaddr {
             let offset = vaddr - segment.address();
             if offset < segment.size() {
@@ -96,68 +104,47 @@ pub fn vaddr_conv(elf: &Elf, vaddr: u64) -> Result<u64> {
     Err(Il2CppBinaryError::VAddrConv(vaddr))
 }
 
-fn analyze_reg_rel(elf: &Elf, elf_rel: &[u8], instructions: &[Instruction]) -> HashMap<Reg, u64> {
-    let mut map = HashMap::new();
-    for ins in instructions {
-        match (ins.op(), ins.operands()) {
-            (Op::ADRP, [Operand::Reg { reg, .. }, Operand::Label(Imm::Unsigned(imm))]) => {
-                map.insert(*reg, *imm);
-            }
-            (
-                Op::ADD,
-                [Operand::Reg { reg: a, .. }, Operand::Reg { reg: b, .. }, Operand::Imm64 {
-                    imm: Imm::Unsigned(imm),
-                    ..
-                }],
-            ) => {
-                if a != b {
-                    continue;
-                }
-                map.entry(*a).and_modify(|v| *v += imm);
-            }
-            (
-                Op::LDR,
-                [Operand::Reg { reg: a, .. }, Operand::MemOffset {
-                    reg: b,
-                    offset: Imm::Signed(imm),
-                    ..
-                }],
-            ) => {
-                if a != b {
-                    continue;
-                }
-                map.entry(*a).and_modify(|v| {
-                    // TODO: propogate error
-                    let offset = vaddr_conv(elf, (*v as i64 + imm) as u64).unwrap();
-                    *v = (&elf_rel[offset as usize..offset as usize + 8])
-                        .read_u64::<LittleEndian>()
-                        .unwrap();
-                });
-            }
-            _ => {}
-        }
-    }
-    map
-}
-
 fn try_disassemble(code: &[u8], addr: u64) -> Result<Vec<Instruction>> {
-    disasm(code, addr)
-        .map(|res| res.map_err(Il2CppBinaryError::Disassemble))
-        .collect()
+    let mut decoder = Decoder::with_ip(64, code, addr, DecoderOptions::NONE);
+    let mut instructions: Vec<Instruction> = Vec::new();
+    while decoder.can_decode() {
+        instructions.push(decoder.decode());
+    }
+    Ok(instructions)
 }
 
-fn nth_bl(elf: &Elf, addr: u64, n: usize) -> Result<u64> {
-    let offset = vaddr_conv(elf, addr)?;
+fn nth_jmp<'data>(coff: &File, data: &'data [u8], addr: u64, n: usize) -> Result<u64> {
+    let offset = vaddr_conv(coff, addr)?;
+
+    let cs = Capstone::new()
+        .x86()
+        .mode(arch::x86::ArchMode::Mode64)
+        .syntax(arch::x86::ArchSyntax::Att)
+        .detail(true)
+        .build()
+        .expect("failed to create Capstone object");
+
+    let code = &data[offset as usize..];
+    let insns = cs.disasm_all(code, addr).expect("Failed to disassemble");
+
     let mut count = 0;
 
-    for i in 0.. {
-        let offset = offset + i * 4;
-        let code = &elf.data()[offset as usize..offset as usize + 4];
-        let ins = &try_disassemble(code, addr + i * 4)?[0];
-        if let (Op::BL, [Operand::Label(Imm::Unsigned(target))]) = (ins.op(), ins.operands()) {
+    for i in insns.as_ref() {
+        if cs.insn_name(i.id()).expect("Failed to get insn name") == "jmp" {
             count += 1;
-            if count == n {
-                return Ok(*target);
+        }
+
+        if count == n {
+            let detail = cs.insn_detail(&i).expect("failed to get detail");
+            let arch_detail = detail.arch_detail();
+            let x86_detail = arch_detail.x86().expect("failed to get x86 arch detail");
+            let ops = x86_detail.operands();
+
+            for op in ops {
+                match op.op_type {
+                    X86OperandType::Imm(immediate) => return Ok(immediate as u64),
+                    _ => { break; }
+                }
             }
         }
     }
@@ -165,24 +152,106 @@ fn nth_bl(elf: &Elf, addr: u64, n: usize) -> Result<u64> {
     unreachable!()
 }
 
-/// Finds and returns the address of the first `blr` instruction it comes across starting from `addr`.
-fn find_blr(elf: &Elf, addr: u64, limit: usize) -> Result<Option<(u64, Reg)>> {
-    let offset = vaddr_conv(elf, addr)?;
-    for i in 0..limit {
-        let offset = offset + i as u64 * 4;
-        let code = &elf.data()[offset as usize..offset as usize + 4];
-        let ins = &try_disassemble(code, addr + i as u64 * 4)?[0];
-        if let (Op::BLR, [Operand::Reg { reg, .. }]) = (ins.op(), ins.operands()) {
-            return Ok(Some((offset, *reg)));
+fn nth_call<'data>(coff: &File, data: &'data [u8], addr: u64, n: usize) -> Result<u64> {
+    let offset = vaddr_conv(coff, addr)?;
+
+    let cs = Capstone::new()
+        .x86()
+        .mode(arch::x86::ArchMode::Mode64)
+        .syntax(arch::x86::ArchSyntax::Att)
+        .detail(true)
+        .build()
+        .expect("failed to create Capstone object");
+
+    let code = &data[offset as usize..];
+    let insns = cs.disasm_count(&code, addr, 4096).expect("Failed to disassemble");
+
+    //println!("Found {} instructions", insns.len());
+
+    let mut count = 0;
+
+    for i in insns.iter() {
+        //println!("{}", i);
+
+        if cs.insn_name(i.id()).expect("Failed to get insn name") == "call" {
+            count += 1;
+        }
+
+        if count == n {
+            let detail = cs.insn_detail(&i).expect("failed to get detail");
+            let arch_detail = detail.arch_detail();
+            let x86_detail = arch_detail.x86().expect("failed to get x86 arch detail");
+            let ops = x86_detail.operands();
+
+            for op in ops {
+                match op.op_type {
+                    X86OperandType::Imm(immediate) => {
+                        return Ok(immediate as u64)
+                    }
+                    _ => { break; }
+                }
+            }
         }
     }
-    Ok(None)
+
+    unreachable!()
 }
 
-fn process_relocations(elf: &Elf) -> Result<Vec<u8>> {
-    let mut elf_rel = elf.data().to_vec();
+fn nth_mov<'data>(coff: &File, data: &'data [u8], addr: u64, n: usize) -> Result<u64> {
+    let offset = vaddr_conv(coff, addr)?;
 
-    if let Some(relocations) = elf.dynamic_relocations() {
+    let cs = Capstone::new()
+        .x86()
+        .mode(arch::x86::ArchMode::Mode64)
+        .syntax(arch::x86::ArchSyntax::Att)
+        .detail(true)
+        .build()
+        .expect("failed to create Capstone object");
+
+    let code = &data[offset as usize..];
+    let insns = cs.disasm_all(&code, addr).expect("Failed to disassemble");
+
+    println!("Found {} instructions", insns.len());
+
+    let mut count = 0;
+
+    for i in insns.iter() {
+
+        if cs.insn_name(i.id()).expect("Failed to get insn name") == "mov" {
+            count += 1;
+            println!("{}", i);
+            println!("Found {} of {}", count, n);
+        }
+
+        if count == n {
+            let detail = cs.insn_detail(&i).expect("failed to get detail");
+            let arch_detail = detail.arch_detail();
+            let x86_detail = arch_detail.x86().expect("failed to get x86 arch detail");
+            let ops = x86_detail.operands();
+
+            for op in ops {
+                match op.op_type {
+                    X86OperandType::Imm(immediate) => return Ok(immediate as u64),
+                    X86OperandType::Mem(mem) => {
+                        if cs.reg_name(mem.base()).expect("Failed to get reg name") != "rip" {
+                            break;
+                        }
+
+                        return Ok(i.address() + (i.len() as u64) + ( mem.disp() as u64))
+                    }
+                    _ => { break; }
+                }
+            }
+        }
+    }
+
+    unreachable!()
+}
+
+fn process_relocations<'data>(coff: &File, data: &'data [u8]) -> Result<Vec<u8>> {
+    let mut coff_rel = data.to_vec();
+
+    if let Some(relocations) = coff.dynamic_relocations() {
         for (addr, rel) in relocations {
             if rel.encoding() != RelocationEncoding::Generic || rel.target() != RelocationTarget::Absolute {
                 // TODO: handle more relocation types
@@ -191,49 +260,39 @@ fn process_relocations(elf: &Elf) -> Result<Vec<u8>> {
 
             let target = rel.addend() as u64;
 
-            let mut cur = Cursor::new(&mut elf_rel);
-            cur.set_position(vaddr_conv(elf, addr)?);
+            let mut cur = Cursor::new(&mut coff_rel);
+            cur.set_position(vaddr_conv(coff, addr)?);
             cur.write_u64::<LittleEndian>(target)?;
         }
     }
 
-    Ok(elf_rel)
+    Ok(coff_rel)
 }
 
 /// Returns address to (g_CodeRegistration, g_MetadataRegistration)
-fn find_registration(elf: &Elf, elf_rel: &[u8]) -> Result<(u64, u64)> {
-    let il2cpp_init = elf
-        .dynamic_symbols()
-        .find(|s| s.name() == Ok("il2cpp_init"))
+fn find_registration<'data>(coff: &File, data: &'data [u8]) -> Result<(u64, u64)> {
+    let il2cpp_init = coff
+        .exports()?
+        .iter().find(|s| str::from_utf8(s.name()) == Ok("il2cpp_init"))
         .ok_or(Il2CppBinaryError::MissingIl2CppInit)?
         .address();
-    let runtime_init = nth_bl(elf, il2cpp_init, 2)?;
-    let runtime_init_offset = vaddr_conv(elf, runtime_init)?;
 
-    let (blr_offset, blr_reg) =
-        find_blr(elf, runtime_init, 200)?.ok_or(Il2CppBinaryError::MissingBlr)?;
+    let runtime_init = nth_call(coff, &data, il2cpp_init, 2)?;
+    let metadatacache_initialize = nth_call(coff, &data,runtime_init, 16)?;
 
-    let instructions = try_disassemble(
-        &elf.data()[runtime_init_offset as usize..blr_offset as usize],
-        runtime_init,
-    )?;
-    let regs = analyze_reg_rel(elf, &elf_rel, &instructions);
+    let metadata_registration = nth_mov(coff, &data, metadatacache_initialize, 2)?;
+    let code_registration = nth_mov(coff, &data, metadatacache_initialize, 43)?;
 
-    let fn_addr = vaddr_conv(elf, regs[&blr_reg])?;
-    let code = &elf.data()[fn_addr as usize..fn_addr as usize + 7 * 4];
-    let instructions = try_disassemble(code, regs[&blr_reg])?;
-    let regs = analyze_reg_rel(elf, &elf_rel, instructions.as_slice());
-
-    Ok((regs[&Reg::X0], regs[&Reg::X1]))
+    Ok((code_registration, metadata_registration))
 }
 
-struct ElfReader<'elf, 'data, 'elf_rel> {
-    elf: &'elf Elf<'data>,
-    elf_rel: &'elf_rel [u8],
+struct CoffReader<'coff, 'data> {
+    elf: &'coff File<'data>,
+    elf_rel: &'data [u8],
 }
 
-impl<'elf, 'data, 'elf_rel> ElfReader<'elf, 'data, 'elf_rel> {
-    fn new(elf: &'elf Elf<'data>, elf_rel: &'elf_rel [u8]) -> Self {
+impl<'coff, 'data> CoffReader<'coff, 'data> {
+    fn new(elf: &'coff File<'data>, elf_rel: &'data [u8]) -> Self {
         Self { elf, elf_rel }
     }
 
@@ -246,11 +305,11 @@ impl<'elf, 'data, 'elf_rel> ElfReader<'elf, 'data, 'elf_rel> {
 
     fn get_str(&self, vaddr: u64) -> Result<&'data str> {
         let ptr = vaddr_conv(self.elf, vaddr)?;
-        get_str(self.elf.data(), ptr as usize)
+        get_str(self.elf_rel, ptr as usize)
     }
 }
 
-fn read_arr<T>(reader: &ElfReader, vaddr: u64, len: usize) -> Result<Vec<T>>
+fn read_arr<T>(reader: &CoffReader, vaddr: u64, len: usize) -> Result<Vec<T>>
 where
     T: BinRead,
 {
@@ -262,7 +321,7 @@ where
     Ok(vec)
 }
 
-fn read_len_arr<T>(reader: &ElfReader, cur: &mut Cursor<&[u8]>) -> Result<Vec<T>>
+fn read_len_arr<T>(reader: &CoffReader, cur: &mut Cursor<&[u8]>) -> Result<Vec<T>>
 where
     T: BinRead,
 {
@@ -272,7 +331,7 @@ where
     read_arr(reader, addr, count)
 }
 
-fn read_len_arr_nullable<T>(reader: &ElfReader, cur: &mut Cursor<&[u8]>) -> Result<Vec<T>>
+fn read_len_arr_nullable<T>(reader: &CoffReader, cur: &mut Cursor<&[u8]>) -> Result<Vec<T>>
 where
     T: BinRead + Default + Clone,
 {
@@ -287,7 +346,7 @@ where
 }
 
 impl<'data> Il2CppCodeGenModule<'data> {
-    fn read<'elf>(reader: &ElfReader<'elf, 'data, '_>, vaddr: u64) -> Result<Self> {
+    fn read<'elf>(reader: &CoffReader<'elf, 'data>, vaddr: u64) -> Result<Self> {
         let mut cur = reader.make_cur(vaddr)?;
 
         let name = reader.get_str(cur.read_u64::<LittleEndian>()?)?;
@@ -315,8 +374,8 @@ impl<'data> Il2CppCodeGenModule<'data> {
 }
 
 impl<'data> Il2CppCodeRegistration<'data> {
-    fn read(elf: &Elf<'data>, elf_rel: &[u8], addr: u64) -> Result<Self> {
-        let reader = ElfReader::new(elf, elf_rel);
+    fn read(coff: &File<'data>, data: &'data [u8], addr: u64) -> Result<Self> {
+        let reader = CoffReader::new(coff, &data);
         let mut cur = reader.make_cur(addr)?;
 
         let reverse_pinvoke_wrappers = read_len_arr(&reader, &mut cur)?;
@@ -359,7 +418,7 @@ impl<'data> Il2CppCodeRegistration<'data> {
 
 impl Il2CppType {
     fn read(
-        reader: &ElfReader,
+        reader: &CoffReader,
         vaddr: u64,
         type_map: &HashMap<u64, usize>,
         generic_class_map: &HashMap<u64, usize>,
@@ -408,7 +467,7 @@ impl Il2CppType {
 
 impl Il2CppGenericClass {
     fn read(
-        reader: &ElfReader,
+        reader: &CoffReader,
         vaddr: u64,
         generic_inst_map: &HashMap<u64, usize>,
         type_map: &HashMap<u64, usize>,
@@ -440,7 +499,7 @@ impl Il2CppGenericContext {
 }
 
 impl Il2CppGenericInst {
-    fn read(reader: &ElfReader, vaddr: u64, types_map: &HashMap<u64, usize>) -> Result<Self> {
+    fn read(reader: &CoffReader, vaddr: u64, types_map: &HashMap<u64, usize>) -> Result<Self> {
         let mut cur = reader.make_cur(vaddr)?;
 
         let type_ptrs = read_len_arr(reader, &mut cur)?;
@@ -453,7 +512,7 @@ impl Il2CppGenericInst {
 }
 
 impl Il2CppArrayType {
-    fn read(reader: &ElfReader, vaddr: u64, types_map: &HashMap<u64, usize>) -> Result<Self> {
+    fn read(reader: &CoffReader, vaddr: u64, types_map: &HashMap<u64, usize>) -> Result<Self> {
         let mut cur = reader.make_cur(vaddr)?;
 
         let elem_ty_ptr = cur.read_u64::<LittleEndian>()?;
@@ -477,8 +536,8 @@ impl Il2CppArrayType {
 }
 
 impl Il2CppMetadataRegistration {
-    fn read(elf: &Elf, elf_rel: &[u8], addr: u64, metadata: &GlobalMetadata) -> Result<Self> {
-        let reader = ElfReader::new(elf, elf_rel);
+    fn read(coff: &File, data: &[u8], addr: u64, metadata: &GlobalMetadata) -> Result<Self> {
+        let reader = CoffReader::new(coff, data);
         let mut cur = reader.make_cur(addr)?;
 
         let generic_class_addrs = read_len_arr(&reader, &mut cur)?;
@@ -556,12 +615,17 @@ impl Il2CppMetadataRegistration {
 
 impl<'data> RuntimeMetadata<'data> {
     /// Read runtime metadata information from an [`Elf`].
-    pub fn read(elf: &Elf<'data>, global_metadata: &GlobalMetadata) -> Result<Self> {
-        let elf_rel = process_relocations(elf)?;
+    pub fn read(coff: &File<'data>, data: &'data [u8], global_metadata: &GlobalMetadata) -> Result<Self> {
+        let (cr_addr, mr_addr) = find_registration(coff, &data)?;
 
-        let (cr_addr, mr_addr) = find_registration(elf, &elf_rel)?;
-        let code_registration = Il2CppCodeRegistration::read(elf, &elf_rel, cr_addr)?;
-        let metadata_registration = Il2CppMetadataRegistration::read(elf, &elf_rel, mr_addr, global_metadata)?;
+        println!("CR: {:x} MR: {:x}", cr_addr, mr_addr);
+
+        //let cr_offset = vaddr_conv(coff, cr_addr)?;
+        //let mr_offset = vaddr_conv(coff, mr_addr)?;
+
+        let code_registration = Il2CppCodeRegistration::read(coff, &data, cr_addr)?;
+        let metadata_registration = Il2CppMetadataRegistration::read(coff, &data, mr_addr, global_metadata)?;
+
         Ok(RuntimeMetadata {
             code_registration,
             metadata_registration,
@@ -569,8 +633,8 @@ impl<'data> RuntimeMetadata<'data> {
     }
 
     /// Read runtime metadata information from raw ELF data.
-    pub fn read_elf(elf_data: &'data [u8], global_metadata: &GlobalMetadata) -> Result<Self> {
-        let elf = Elf::parse(elf_data)?;
-        Self::read(&elf, global_metadata)
+    pub fn read_coff(coff_data: &'data [u8], global_metadata: &GlobalMetadata) -> Result<Self> {
+        let object = File::parse(coff_data)?;
+        Self::read(&object, coff_data, global_metadata)
     }
 }
