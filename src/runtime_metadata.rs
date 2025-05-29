@@ -2,6 +2,8 @@ pub mod source;
 
 #[cfg(feature = "elf")]
 pub mod elf;
+#[cfg(feature = "pe")]
+pub mod pe;
 
 use binread::BinRead;
 use crate::global_metadata::{Token, TypeDefinitionIndex, GenericParameterIndex, MethodIndex};
