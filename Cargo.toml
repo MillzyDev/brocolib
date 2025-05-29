@@ -4,10 +4,6 @@ version = "0.1.0"
 authors = ["StackDoubleFlow <ojaslandge@gmail.com>"]
 edition = "2021"
 
-[features]
-elf = ["dep:bad64"]
-pe = ["dep:capstone"]
-
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
@@ -17,5 +13,5 @@ byteorder = "1.4"
 object = "0.36"
 binread = "2.2"
 
-bad64 = { version = "0.9", optional = true }
-capstone = { version = "0.13.0", optional = true }
+bad64 = "0.9"
+capstone = "0.13.0"
