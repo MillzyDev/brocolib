@@ -1,4 +1,6 @@
 pub mod source;
+
+#[cfg(feature = "elf")]
 pub mod elf;
 
 use binread::BinRead;
