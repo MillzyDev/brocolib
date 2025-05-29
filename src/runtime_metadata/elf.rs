@@ -113,7 +113,7 @@ fn try_disassemble(code: &[u8], addr: u64) -> Result<Vec<Instruction>> {
     Ok(instructions)
 }
 
-fn nth_jmp<'data>(coff: &File, data: &'data [u8], addr: u64, n: usize) -> Result<u64> {
+fn nth_lea<'data>(coff: &File, data: &'data [u8], addr: u64, n: usize) -> Result<u64> {
     let offset = vaddr_conv(coff, addr)?;
 
     let cs = Capstone::new()
@@ -130,11 +130,13 @@ fn nth_jmp<'data>(coff: &File, data: &'data [u8], addr: u64, n: usize) -> Result
     let mut count = 0;
 
     for i in insns.as_ref() {
-        if cs.insn_name(i.id()).expect("Failed to get insn name") == "jmp" {
+        if cs.insn_name(i.id()).expect("Failed to get insn name") == "lea" {
             count += 1;
         }
 
         if count == n {
+            println!("{}", i);
+
             let detail = cs.insn_detail(&i).expect("failed to get detail");
             let arch_detail = detail.arch_detail();
             let x86_detail = arch_detail.x86().expect("failed to get x86 arch detail");
@@ -142,7 +144,13 @@ fn nth_jmp<'data>(coff: &File, data: &'data [u8], addr: u64, n: usize) -> Result
 
             for op in ops {
                 match op.op_type {
-                    X86OperandType::Imm(immediate) => return Ok(immediate as u64),
+                    X86OperandType::Mem(mem) => {
+                        if cs.reg_name(mem.base()).expect("Failed to get reg name") != "rip" {
+                            break;
+                        }
+
+                        return Ok(i.address() + (i.len() as u64) + ( mem.disp() as u64))
+                    }
                     _ => { break; }
                 }
             }
@@ -178,6 +186,8 @@ fn nth_call<'data>(coff: &File, data: &'data [u8], addr: u64, n: usize) -> Resul
         }
 
         if count == n {
+            println!("{}", i);
+
             let detail = cs.insn_detail(&i).expect("failed to get detail");
             let arch_detail = detail.arch_detail();
             let x86_detail = arch_detail.x86().expect("failed to get x86 arch detail");
@@ -187,6 +197,16 @@ fn nth_call<'data>(coff: &File, data: &'data [u8], addr: u64, n: usize) -> Resul
                 match op.op_type {
                     X86OperandType::Imm(immediate) => {
                         return Ok(immediate as u64)
+                    }
+                    X86OperandType::Mem(mem) => {
+                        if cs.reg_name(mem.base()).expect("Failed to get reg name") != "rip" {
+                            break;
+                        }
+
+                        println!("Addr:    {:x}    Len: {}    Disp: {:x}", i.address(), i.len(), mem.disp());
+                        println!("Calculated Target: {:x}", i.address() + (i.len() as u64) + ( mem.disp() as u64));
+
+                        return Ok(i.address() + (i.len() as u64) + ( mem.disp() as u64))
                     }
                     _ => { break; }
                 }
@@ -278,10 +298,19 @@ fn find_registration<'data>(coff: &File, data: &'data [u8]) -> Result<(u64, u64)
         .address();
 
     let runtime_init = nth_call(coff, &data, il2cpp_init, 2)?;
-    let metadatacache_initialize = nth_call(coff, &data,runtime_init, 16)?;
+    let registration_function_ptr = nth_call(coff, &data, runtime_init, 15)?;
 
-    let metadata_registration = nth_mov(coff, &data, metadatacache_initialize, 2)?;
-    let code_registration = nth_mov(coff, &data, metadatacache_initialize, 43)?;
+    let registration_function_ptr_offset = vaddr_conv(coff, registration_function_ptr)?;
+
+    let mut buf: [u8; 8] = [0x0; 8];
+    buf[0..].copy_from_slice(&data[registration_function_ptr_offset as usize..][..8]);
+    let registration_function = u64::from_le_bytes(buf);
+    println!("Found registration function: {:x}", registration_function);
+
+    let metadata_registration = nth_lea(coff, &data, registration_function, 2).expect("Failed to get metadata registration");
+    //let metadata_registration = vaddr_conv(coff, metadata_registration)?;
+    let code_registration = nth_lea(coff, &data, registration_function, 3).expect("Failed to get code registration");
+    //let code_registration = vaddr_conv(coff, code_registration)?;
 
     Ok((code_registration, metadata_registration))
 }
@@ -619,9 +648,6 @@ impl<'data> RuntimeMetadata<'data> {
         let (cr_addr, mr_addr) = find_registration(coff, &data)?;
 
         println!("CR: {:x} MR: {:x}", cr_addr, mr_addr);
-
-        //let cr_offset = vaddr_conv(coff, cr_addr)?;
-        //let mr_offset = vaddr_conv(coff, mr_addr)?;
 
         let code_registration = Il2CppCodeRegistration::read(coff, &data, cr_addr)?;
         let metadata_registration = Il2CppMetadataRegistration::read(coff, &data, mr_addr, global_metadata)?;
