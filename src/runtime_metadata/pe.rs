@@ -203,8 +203,17 @@ impl<'data> RuntimeMetadata<'data> {
     }
 
     /// Read runtime metadata information from raw pe data.
-    pub fn read_pe(coff_data: &'data [u8], global_metadata: &GlobalMetadata) -> Result<Self> {
-        let object = File::parse(coff_data)?;
-        Self::read(&object, coff_data, global_metadata)
+    pub fn read_pe(data: &'data [u8], global_metadata: &GlobalMetadata) -> Result<Self> {
+        let object = File::parse(data)?;
+
+        let (cr_addr, mr_addr) = find_registration(&object, &data)?;
+
+        let code_registration = Il2CppCodeRegistration::read(&object, &data, cr_addr)?;
+        let metadata_registration = Il2CppMetadataRegistration::read(&object, &data, mr_addr, global_metadata)?;
+
+        Ok(RuntimeMetadata {
+            code_registration,
+            metadata_registration,
+        })
     }
 }

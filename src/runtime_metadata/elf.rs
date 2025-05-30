@@ -152,22 +152,19 @@ fn find_registration(elf: &File, elf_rel: &[u8]) -> Result<(u64, u64)> {
 }
 
 impl<'data> RuntimeMetadata<'data> {
-    /// Read runtime metadata information from an [`Elf`].
-    pub fn read(elf: &File<'data>, global_metadata: &GlobalMetadata) -> Result<Self> {
-        let elf_rel = process_relocations(elf)?;
+    /// Read runtime metadata information from raw ELF data.
+    pub fn read_elf(data: &'data [u8], global_metadata: &GlobalMetadata) -> Result<Self> {
+        let object = File::parse(data)?;
 
-        let (cr_addr, mr_addr) = find_registration(elf, &elf_rel)?;
-        let code_registration = Il2CppCodeRegistration::read(elf, &elf_rel, cr_addr)?;
-        let metadata_registration = Il2CppMetadataRegistration::read(elf, &elf_rel, mr_addr, global_metadata)?;
+        let object_rel = process_relocations(&object)?;
+
+        let (cr_addr, mr_addr) = find_registration(&object, &object_rel)?;
+        let code_registration = Il2CppCodeRegistration::read(&object, &object_rel, cr_addr)?;
+        let metadata_registration = Il2CppMetadataRegistration::read(&object, &object_rel, mr_addr, global_metadata)?;
+
         Ok(RuntimeMetadata {
             code_registration,
             metadata_registration,
         })
-    }
-
-    /// Read runtime metadata information from raw ELF data.
-    pub fn read_elf(elf_data: &'data [u8], global_metadata: &GlobalMetadata) -> Result<Self> {
-        let object = File::parse(elf_data)?;
-        Self::read(&object, global_metadata)
     }
 }
