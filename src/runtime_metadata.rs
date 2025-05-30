@@ -520,7 +520,7 @@ where
 }
 
 impl<'data> Il2CppCodeGenModule<'data> {
-    fn read<'elf>(reader: &ObjectReader, vaddr: u64) -> errors::Result<Self> {
+    fn read<'elf>(reader: &ObjectReader<'_, 'data>, vaddr: u64) -> errors::Result<Self> {
         let mut cur = reader.make_cur(vaddr)?;
 
         let name = reader.get_str(cur.read_u64::<LittleEndian>()?)?;
@@ -548,7 +548,7 @@ impl<'data> Il2CppCodeGenModule<'data> {
 }
 
 impl<'data> Il2CppCodeRegistration<'data> {
-    fn read(object: &File<'data>, object_rel: &[u8], addr: u64) -> errors::Result<Self> {
+    fn read(object: &File<'data>, object_rel: &'data [u8], addr: u64) -> errors::Result<Self> {
         let reader = ObjectReader::new(object, object_rel);
         let mut cur = reader.make_cur(addr)?;
 

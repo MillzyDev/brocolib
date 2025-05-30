@@ -70,13 +70,13 @@ fn try_disassemble(code: &[u8], addr: u64) -> Result<Vec<Instruction>> {
         .collect()
 }
 
-fn nth_bl(elf: &File, addr: u64, n: usize) -> Result<u64> {
+fn nth_bl<'data>(elf: &File, data: &'data [u8],addr: u64, n: usize) -> Result<u64> {
     let offset = vaddr_conv(elf, addr)?;
     let mut count = 0;
 
     for i in 0.. {
         let offset = offset + i * 4;
-        let code = &elf.data()[offset as usize..offset as usize + 4];
+        let code = &data[offset as usize..offset as usize + 4];
         let ins = &try_disassemble(code, addr + i * 4)?[0];
         if let (Op::BL, [Operand::Label(Imm::Unsigned(target))]) = (ins.op(), ins.operands()) {
             count += 1;
@@ -90,11 +90,11 @@ fn nth_bl(elf: &File, addr: u64, n: usize) -> Result<u64> {
 }
 
 /// Finds and returns the address of the first `blr` instruction it comes across starting from `addr`.
-fn find_blr(elf: &File, addr: u64, limit: usize) -> Result<Option<(u64, Reg)>> {
+fn find_blr<'data>(elf: &File, data: &'data [u8], addr: u64, limit: usize) -> Result<Option<(u64, Reg)>> {
     let offset = vaddr_conv(elf, addr)?;
     for i in 0..limit {
         let offset = offset + i as u64 * 4;
-        let code = &elf.data()[offset as usize..offset as usize + 4];
+        let code = &data[offset as usize..offset as usize + 4];
         let ins = &try_disassemble(code, addr + i as u64 * 4)?[0];
         if let (Op::BLR, [Operand::Reg { reg, .. }]) = (ins.op(), ins.operands()) {
             return Ok(Some((offset, *reg)));
@@ -103,8 +103,8 @@ fn find_blr(elf: &File, addr: u64, limit: usize) -> Result<Option<(u64, Reg)>> {
     Ok(None)
 }
 
-fn process_relocations(elf: &File) -> Result<Vec<u8>> {
-    let mut elf_rel = elf.data().to_vec();
+fn process_relocations<'data>(elf: &File, data: &'data [u8]) -> Result<Vec<u8>> {
+    let mut elf_rel = data.to_vec();
 
     if let Some(relocations) = elf.dynamic_relocations() {
         for (addr, rel) in relocations {
@@ -125,26 +125,26 @@ fn process_relocations(elf: &File) -> Result<Vec<u8>> {
 }
 
 /// Returns address to (g_CodeRegistration, g_MetadataRegistration)
-fn find_registration(elf: &File, elf_rel: &[u8]) -> Result<(u64, u64)> {
+fn find_registration<'data>(elf: &File, data: &'data [u8], elf_rel: &[u8]) -> Result<(u64, u64)> {
     let il2cpp_init = elf
         .dynamic_symbols()
         .find(|s| s.name() == Ok("il2cpp_init"))
         .ok_or(Il2CppBinaryError::MissingIl2CppInit)?
         .address();
-    let runtime_init = nth_bl(elf, il2cpp_init, 2)?;
+    let runtime_init = nth_bl(elf, elf_rel, il2cpp_init, 2)?;
     let runtime_init_offset = vaddr_conv(elf, runtime_init)?;
 
     let (blr_offset, blr_reg) =
-        find_blr(elf, runtime_init, 200)?.ok_or(Il2CppBinaryError::MissingBlr)?;
+        find_blr(elf, elf_rel, runtime_init, 200)?.ok_or(Il2CppBinaryError::MissingBlr)?;
 
     let instructions = try_disassemble(
-        &elf.data()[runtime_init_offset as usize..blr_offset as usize],
+        &data[runtime_init_offset as usize..blr_offset as usize],
         runtime_init,
     )?;
     let regs = analyze_reg_rel(elf, &elf_rel, &instructions);
 
     let fn_addr = vaddr_conv(elf, regs[&blr_reg])?;
-    let code = &elf.data()[fn_addr as usize..fn_addr as usize + 7 * 4];
+    let code = &data[fn_addr as usize..fn_addr as usize + 7 * 4];
     let instructions = try_disassemble(code, regs[&blr_reg])?;
     let regs = analyze_reg_rel(elf, &elf_rel, instructions.as_slice());
 
@@ -156,9 +156,9 @@ impl<'data> RuntimeMetadata<'data> {
     pub fn read_elf(data: &'data [u8], global_metadata: &GlobalMetadata) -> Result<Self> {
         let object = File::parse(data)?;
 
-        let object_rel = process_relocations(&object)?;
+        let object_rel = process_relocations(&object, &data)?;
 
-        let (cr_addr, mr_addr) = find_registration(&object, &object_rel)?;
+        let (cr_addr, mr_addr) = find_registration(&object, &data, &object_rel)?;
         let code_registration = Il2CppCodeRegistration::read(&object, &object_rel, cr_addr)?;
         let metadata_registration = Il2CppMetadataRegistration::read(&object, &object_rel, mr_addr, global_metadata)?;
 
