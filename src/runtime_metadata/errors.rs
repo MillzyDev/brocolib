@@ -2,9 +2,6 @@
 use bad64::DecodeError;
 use thiserror::Error;
 
-#[cfg(feature = "elf")]
-use bad64::DecodeError;
-
 pub type Result<T> = std::result::Result<T, Il2CppBinaryError>;
 
 #[derive(Error, Debug, Clone, Copy)]
