@@ -1,4 +1,5 @@
 ﻿use std::io;
+use bad64::DecodeError;
 use thiserror::Error;
 
 #[cfg(feature = "elf")]
@@ -12,7 +13,6 @@ pub struct DisassembleError;
 
 #[derive(Error, Debug)]
 pub enum Il2CppBinaryError {
-    #[cfg(feature = "elf")]
     #[error("error disassembling code")]
     Disassemble(DecodeError),
 
