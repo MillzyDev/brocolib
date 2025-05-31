@@ -424,7 +424,7 @@ pub fn strlen(data: &[u8], offset: usize) -> usize {
 
 pub fn get_str(data: &[u8], offset: usize) -> errors::Result<&str> {
     let len = strlen(data, offset);
-    let str = str::from_utf8(&data[offset..offset + len])?;
+    let str = std::str::from_utf8(&data[offset..offset + len])?;
     Ok(str)
 }
 
