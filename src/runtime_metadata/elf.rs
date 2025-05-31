@@ -1,3 +1,4 @@
+/*
 //! ELF runtime metadata parsing.
 //!
 //! For IL2CPP Unity games that are built for linux or linux-based platforms,
@@ -171,3 +172,4 @@ impl<'data> RuntimeMetadata<'data> {
         Self::read_elf_runtime(&object, data, global_metadata)
     }
 }
+*/

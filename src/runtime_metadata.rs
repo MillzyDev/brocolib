@@ -1,5 +1,5 @@
 pub mod source;
-pub mod elf;
+//pub mod elf;
 pub mod pe;
 pub mod errors;
 

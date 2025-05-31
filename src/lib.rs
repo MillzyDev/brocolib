@@ -8,7 +8,7 @@
 pub mod global_metadata;
 pub mod runtime_metadata;
 
-use runtime_metadata::elf::Il2CppBinaryError;
+use runtime_metadata::errors::Il2CppBinaryError;
 use runtime_metadata::RuntimeMetadata;
 use global_metadata::{GlobalMetadata, MetadataDeserializeError};
 use thiserror::Error;
@@ -45,13 +45,25 @@ pub enum MetadataParseError {
     Binary(#[from] Il2CppBinaryError),
 }
 
+pub enum ObjectFormat {
+    Elf,
+    Pe
+}
+
 impl<'gmd, 'rmd> Metadata<'gmd, 'rmd> {
-    pub fn parse(global_metadata: &'gmd [u8], elf: &'rmd [u8]) -> Result<Self, MetadataParseError> {
-        let global_metadata = global_metadata::deserialize(global_metadata)?;
-        let runtime_metadata = RuntimeMetadata::read_elf(elf, &global_metadata)?;
+    pub fn parse(global_metadata: &'gmd [u8], binary: &'rmd [u8], object_format: ObjectFormat) -> Result<Self, MetadataParseError> {
+        let gm: GlobalMetadata = global_metadata::deserialize(global_metadata)?;
+
+        let mut rm: RuntimeMetadata = RuntimeMetadata::read_pe(binary, &gm)?;
+        //match object_format {
+        //    ObjectFormat::Elf => { rm = RuntimeMetadata::read_elf(binary, &gm)? }
+        //    ObjectFormat::Pe => { rm = RuntimeMetadata::read_pe(binary, &gm)? }
+        //}
+
         Ok(Metadata {
-            global_metadata,
-            runtime_metadata,
+            global_metadata: gm,
+            runtime_metadata: rm,
         })
     }
+
 }
